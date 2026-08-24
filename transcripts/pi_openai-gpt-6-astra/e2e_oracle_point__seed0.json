@@ -1,0 +1,461 @@
+{
+  "task_id": "e2e_oracle_point",
+  "system_id": "pi/openai-gpt-6-astra",
+  "seed_idx": 0,
+  "turns": [
+    {
+      "prompt": "You are given alloy_pair_max_train.csv, a steel/superalloy dataset of 300 samples. Each sample is described by composition in wt% — C, Mn, Si, Cr, Ni, Mo, V, Nb, Co, Al, Ti, Cu\n      (Fe is the balance: Fe = 100 − Σ of the others) — plus processing parameters\n      (solutionizing_temp, aging_temp, aging_time, cooling_rate) and categorical\n      settings heat_treatment (annealed | quenched | quench_temper | solution_aged)\n      and route (cast | wrought | AM), and the measured 0.2 % proof yield strength in MPa (the `target` column).\n\nBuild a predictive model, then propose the COMPLETE recipe (composition + processing + categoricals) that MAXIMIZES yield strength.\n\nValidity is required: every wt% ≥ 0 and the alloying elements must sum to ≤ 100 (Fe is the balance) — an invalid recipe scores zero.\n\nState the predicted yield strength in MPa, then end your answer with the\ncomplete recipe as a single `Final:` block — comma-separated `name=value`\npairs, exactly these field names, no blank line inside it (Fe is the balance,\ndo not state it):\n\nFinal: C=<wt%>, Mn=<wt%>, Si=<wt%>, Cr=<wt%>, Ni=<wt%>, Mo=<wt%>, V=<wt%>,\nNb=<wt%>, Co=<wt%>, Al=<wt%>, Ti=<wt%>, Cu=<wt%>, solutionizing_temp=<°C>,\naging_temp=<°C>, aging_time=<h>, cooling_rate=<K/s>,\nheat_treatment=<annealed|quenched|quench_temper|solution_aged>, route=<cast|wrought|AM>\n\n\nThe data files for this task are in your current working directory:\n  - alloy_pair_max_train.csv\nRead them from disk. Give your answer as your final message — do not write it to a file.",
+      "answer_text": "**Predicted yield strength: approximately 756 MPa.**\n\nA regularized quadratic model with pairwise interactions achieved approximately **18 MPa cross-validation RMSE**. The recipe below maximizes its prediction within the observed feature ranges. Alloying elements total **36.3823 wt%**, satisfying the composition constraints.\n\nFinal: C=0.493, Mn=0.872, Si=1.500, Cr=9.801, Ni=9.732, Mo=2.719, V=0.558,\nNb=0.0003, Co=6.312, Al=0.704, Ti=0.691, Cu=3.000, solutionizing_temp=1075.7,\naging_temp=667.8, aging_time=14.9, cooling_rate=57.8,\nheat_treatment=solution_aged, route=wrought",
+      "artifacts": [],
+      "trajectory": [
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "ls -la /work && python - <<'PY'\nimport importlib.util\nfor x in ['pandas','numpy','scipy','sklearn','xgboost','catboost']:\n print(x, bool(importlib.util.find_spec(x)))\nPY"
+          }
+        },
+        {
+          "name": "read",
+          "arguments": {
+            "path": "/work/alloy_pair_max_train.csv",
+            "limit": 35
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "python - <<'PY'\nimport pandas as pd\np=pd.read_csv('alloy_pair_max_train.csv')\nprint('Shape:',p.shape,'\\nMissing:',p.isna().sum().sum())\nprint(p.describe().round(3).to_string())\nfor c in ['heat_treatment','route']:print(p.groupby(c).target.agg(['count','mean','std','min','max']).round(2))\nprint('\\nTop samples\\n',p.nlargest(12,'target').to_string(index=False))\nprint('\\nCorrelations\\n',p.corr(numeric_only=True).target.sort_values().round(3))\nPY"
+          }
+        },
+        {
+          "name": "write",
+          "arguments": {
+            "path": "/tmp/model_alloy.py",
+            "content": "import numpy as np,pandas as pd\nfrom sklearn.model_selection import KFold,cross_val_predict,GridSearchCV\nfrom sklearn.preprocessing import StandardScaler, PolynomialFeatures, SplineTransformer\nfrom sklearn.pipeline import make_pipeline\nfrom sklearn.linear_model import Ridge,LinearRegression,Lasso,ElasticNet\nfrom sklearn.metrics import mean_squared_error,r2_score\nfrom catboost import CatBoostRegressor\nfrom sklearn.ensemble import ExtraTreesRegressor,HistGradientBoostingRegressor\nimport warnings\nwarnings.filterwarnings('ignore')\ndf=pd.read_csv('/work/alloy_pair_max_train.csv')\nnum=[c for c in df.columns if c not in ['Fe','heat_treatment','route','target']]\ncat=['heat_treatment','route']\nXn=df[num]; D=pd.get_dummies(df[cat],drop_first=True,dtype=float)\ny=df.target.values\nz=(Xn-Xn.mean())/Xn.std()\nkf=KFold(5,shuffle=True,random_state=42)\n\ndef assess(name,X,model):\n pred=cross_val_predict(model,X,y,cv=kf,n_jobs=1)\n print(name,'RMSE',round(mean_squared_error(y,pred)**.5,3),'R2',round(r2_score(y,pred),4),flush=True)\n return pred\n\ndef grid(name,X,model,params):\n g=GridSearchCV(make_pipeline(StandardScaler(),model),params,cv=kf,scoring='neg_mean_squared_error',n_jobs=1)\n g.fit(X,y)\n print(name,g.best_params_,'RMSE',round((-g.best_score_)**.5,3),flush=True)\n return g\n\nif __name__=='__main__':\n print('Numeric columns',num)\n Xlin=np.column_stack([z,D])\n assess('Linear',Xlin,make_pipeline(StandardScaler(),Ridge(alpha=1)))\n Xquad=np.column_stack([z,z**2,D])\n m=grid('Additive quadratic',Xquad,Ridge(),{'ridge__alpha':[.001,.01,.1,1,10,100]})\n Xcub=np.column_stack([z,z**2,z**3,D])\n grid('Additive cubic',Xcub,Ridge(),{'ridge__alpha':[.01,.1,1,10,100]})\n Xspline=np.column_stack([SplineTransformer(n_knots=4,degree=3).fit_transform(z),D])\n grid('Additive splines',Xspline,Ridge(),{'ridge__alpha':[.001,.01,.1,1,10,100]})\n Xpoly=PolynomialFeatures(2,include_bias=False).fit_transform(Xlin)\n grid('Full quadratic ridge',Xpoly,Ridge(),{'ridge__alpha':[.01,.1,1,3,10,30,100,300,1000]})\n grid('Full quadratic lasso',Xpoly,Lasso(max_iter=20000),{'lasso__alpha':[.1,.3,1,2,3,5,10]})\n # Include categorical interaction but not numerics\n Xcatquad=np.column_stack([z,z**2,PolynomialFeatures(2,include_bias=False,interaction_only=True).fit_transform(D)])\n grid('Additive quadratic + cat interaction',Xcatquad,Ridge(),{'ridge__alpha':[.001,.01,.1,1,10,100]})\n for depth in [3,4,5,6]:\n  model=CatBoostRegressor(iterations=1200,depth=depth,learning_rate=.03,l2_leaf_reg=5,loss_function='RMSE',cat_features=cat,verbose=False,thread_count=2)\n  assess('Catboost depth '+str(depth),df[num+cat],model)\n # Coefficients of add quad\n model=make_pipeline(StandardScaler(),Ridge(alpha=.01)).fit(Xquad,y)\n co=model[-1].coef_/model[0].scale_\n print('Quadratic coefs standardized features:\\n',pd.DataFrame({'linear':co[:16],'quadratic':co[16:32]},index=num).round(3).to_string())\n print('Categoricals',list(zip(D.columns,co[32:])))\n resid=y-model.predict(Xquad)\n print('Training additive quadratic RMSE',np.sqrt(np.mean(resid**2)))\n"
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/model_alloy.py",
+            "timeout": 240
+          }
+        },
+        {
+          "name": "edit",
+          "arguments": {
+            "path": "/tmp/model_alloy.py",
+            "edits": [
+              {
+                "oldText": "  assess('Catboost depth '+str(depth),df[num+cat],model)",
+                "newText": "  pred=np.zeros(len(y))\n  for tr,te in kf.split(df):\n   model.fit(df[num+cat].iloc[tr],y[tr])\n   pred[te]=model.predict(df[num+cat].iloc[te])\n  print('Catboost depth',depth,'RMSE',round(mean_squared_error(y,pred)**.5,3),flush=True)"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/model_alloy.py",
+            "timeout": 240
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 python - <<'PY'\nimport sys\nsys.path.insert(0,'/tmp');from model_alloy import *\nfrom itertools import combinations\nimport scipy.stats as st\nX=np.column_stack([np.ones(len(y)),z,z**2,D]);names=['intercept']+num+[x+'^2' for x in num]+list(D.columns)\ncoef=np.linalg.lstsq(X,y,rcond=None)[0];res=y-X@coef;dfree=len(y)-len(coef);sd=np.sqrt(np.diag(np.linalg.inv(X.T@X))*sum(res**2)/dfree)\nprint(pd.DataFrame({'coef':coef,'std':sd,'p':2*st.t.sf(abs(coef/sd),dfree)},index=names).round(4).to_string())\npairs=list(combinations(range(16),2));Xint=np.column_stack([z.iloc[:,i]*z.iloc[:,j] for i,j in pairs]);Xir=Xint-X@np.linalg.lstsq(X,Xint,rcond=None)[0]\nci=Xir.T@res/(Xir**2).sum(axis=0);se=np.sqrt(((res[:,None]-Xir*ci)**2).sum(axis=0)/(dfree-1)/(Xir**2).sum(axis=0))\nt=ci/se\nprint('\\nTop interactions:\\n',pd.DataFrame({'coef':ci,'std':se,'p':2*st.t.sf(abs(t),dfree-1)},index=[num[i]+' * '+num[j] for i,j in pairs]).sort_values('p').head(30).round(5).to_string())\nprint('\\nMax for additive model:')\nxmax={}\nfor i,c in enumerate(num):\n b=coef[1+i];a=coef[17+i]\n lb=z[c].min();ub=z[c].max()\n zs=np.array([lb,ub]+([-b/(2*a)] if a<0 and lb<-b/(2*a)<ub else []))\n zv=zs[np.argmax(a*zs**2+b*zs)]\n xmax[c]=zv*Xn[c].std()+Xn[c].mean()\nprint(xmax)\nxz=(pd.DataFrame([xmax])[num]-Xn.mean())/Xn.std();ds=D.loc[(df.heat_treatment=='solution_aged')&(df.route=='wrought')].iloc[[0]].values\nxx=np.column_stack([np.ones(1),xz,xz**2,ds]);print('Prediction',xx@coef,'sum alloys',sum(xmax[c] for c in num[:12]))\nprint('Residual corr with target',np.corrcoef(y,res)[0,1])\nPY"
+          }
+        },
+        {
+          "name": "write",
+          "arguments": {
+            "path": "/tmp/refine_alloy.py",
+            "content": "exec(open('/tmp/model_alloy.py').read().split(\"if __name__=='__main__':\")[0])\nfrom itertools import combinations\nfrom sklearn.base import BaseEstimator,RegressorMixin\nfrom scipy import stats\nfrom sklearn.model_selection import RepeatedKFold\n\nclass SemiModel(RegressorMixin,BaseEstimator):\n def __init__(self,nbase,alpha=1,kind='lasso',ratio=1):\n  self.nbase=nbase;self.alpha=alpha;self.kind=kind;self.ratio=ratio\n def fit(self,X,y):\n  self.s=StandardScaler().fit(X);X=self.s.transform(X)\n  A=np.column_stack([np.ones(len(X)),X[:,:self.nbase]]);B=X[:,self.nbase:]\n  self.proj=np.linalg.lstsq(A,B,rcond=None)[0];R=B-A@self.proj\n  self.base=np.linalg.lstsq(A,y,rcond=None)[0];yr=y-A@self.base\n  if self.kind=='lasso': self.m=Lasso(alpha=self.alpha,fit_intercept=False,max_iter=10000)\n  elif self.kind=='ridge': self.m=Ridge(alpha=self.alpha,fit_intercept=False)\n  else:self.m=ElasticNet(alpha=self.alpha,l1_ratio=self.ratio,fit_intercept=False,max_iter=10000)\n  self.m.fit(R,yr)\n  return self\n def predict(self,X):\n  X=self.s.transform(X);A=np.column_stack([np.ones(len(X)),X[:,:self.nbase]]);R=X[:,self.nbase:]-A@self.proj\n  return A@self.base+self.m.predict(R)\n\nXbase=np.column_stack([z,z**2,D]);nb=Xbase.shape[1]\npairs=list(combinations(range(16),2))\nXint=np.column_stack([z.iloc[:,i]*z.iloc[:,j] for i,j in pairs]);pnames=[num[i]+' * '+num[j] for i,j in pairs]\nX=np.column_stack([Xbase,Xint])\nif __name__=='__main__':\n cv=RepeatedKFold(n_splits=5,n_repeats=3,random_state=42)\n for kind,alphas in [('lasso',[.25,.5,.75,1,1.5,2,3,4,6]),('ridge',[10,30,100,300,1000,3000,10000]),('elastic',[.1,.3,1,3,10])]:\n  g=GridSearchCV(SemiModel(nbase=nb,kind=kind,ratio=.5),{'alpha':alphas},cv=cv,scoring='neg_mean_squared_error',n_jobs=1).fit(X,y)\n  print(kind,g.best_params_,'RMSE',(-g.best_score_)**.5,flush=True)\n  print([(d,round(np.sqrt(-v),3)) for d,v in zip(g.cv_results_['params'],g.cv_results_['mean_test_score'])],flush=True)\n  if kind=='lasso':\n   model=g.best_estimator_\n   print('Nonzero interactions',[(p,round(c,3)) for p,c in zip(pnames,model.m.coef_) if c!=0],flush=True)\n   import joblib\n   joblib.dump(model,'/tmp/alloy_semimodel.joblib')\n # allow categorical-numeric and categorical pair effects also\n Xintextra=np.column_stack([Xint]+[z.iloc[:,i].values*D.iloc[:,j].values for i in range(16) for j in range(D.shape[1])]+[D.iloc[:,i]*D.iloc[:,j] for i,j in combinations(range(D.shape[1]),2)])\n g=GridSearchCV(SemiModel(nbase=nb),{'alpha':[.5,1,1.5,2,3,4,6]},cv=cv,scoring='neg_mean_squared_error',n_jobs=1).fit(np.column_stack([Xbase,Xintextra]),y)\n print('All interactions semi-lasso',g.best_params_,'RMSE',(-g.best_score_)**.5,flush=True)\n extra=pnames+[n+' * '+d for n in num for d in D.columns]+[D.columns[i]+' * '+D.columns[j] for i,j in combinations(range(D.shape[1]),2)]\n print([(p,round(c,3)) for p,c in zip(extra,g.best_estimator_.m.coef_) if c!=0],flush=True)\n # restricted additive model remove clearly insignificant axes\n for excludes in [[],['Si','Nb','Cu'],['Si','Nb','Cu','Ti']]:\n  indices=[i for i,n in enumerate(num) if n not in excludes]\n  xb=np.column_stack([z.iloc[:,indices],z.iloc[:,indices]**2,D]);xx=np.column_stack([xb,Xint])\n  g=GridSearchCV(SemiModel(nbase=xb.shape[1]),{'alpha':[.5,1,1.5,2,3,4,6]},cv=cv,scoring='neg_mean_squared_error',n_jobs=1).fit(xx,y)\n  print('Remove',excludes,'semi-lasso',g.best_params_,'RMSE',(-g.best_score_)**.5,flush=True)\n"
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/refine_alloy.py",
+            "timeout": 180
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python - <<'PY'\nimport sys;sys.path.insert(0,'/tmp');from refine_alloy import *\nfrom sklearn.linear_model import ARDRegression,BayesianRidge\nfrom sklearn.model_selection import cross_val_score\ncv=RepeatedKFold(n_splits=5,n_repeats=3,random_state=42)\nfor thresh in [100,1000,10000,100000]:\n model=make_pipeline(StandardScaler(),ARDRegression(threshold_lambda=thresh,max_iter=1000,tol=.001))\n scores=cross_val_score(model,X,y,cv=cv,scoring='neg_mean_squared_error')\n print('ARD thresh',thresh,'RMSE',np.sqrt(-scores.mean()),flush=True)\n if thresh==10000:\n  model.fit(X,y);coef=model[-1].coef_/model[0].scale_\n  names=num+[n+'^2' for n in num]+list(D.columns)+pnames\n  print([(n,round(v,3)) for n,v in zip(names,coef) if v!=0])\n  import joblib;joblib.dump(model,'/tmp/alloy_ard.joblib')\nPY",
+            "timeout": 180
+          }
+        },
+        {
+          "name": "write",
+          "arguments": {
+            "path": "/tmp/optimize_alloy.py",
+            "content": "import sys\nsys.path.insert(0,'/tmp')\nfrom refine_alloy import *\nfrom scipy.optimize import minimize\nfrom itertools import product\n\nmeans=Xn.mean().values;stds=Xn.std().values\nbounds=[(float(z[c].min()),float(z[c].max())) for c in num]\n\ndef features(zz,dc,indices):\n zz=np.atleast_2d(zz);dd=np.tile(dc,(len(zz),1))\n return np.column_stack([zz[:,indices],zz[:,indices]**2,dd]+[zz[:,i]*zz[:,j] for i,j in pairs])\n\ndef optimize(model,indices,dc,initial=None):\n def obj(zz):return -float(model.predict(features(zz,dc,indices))[0])\n starts=[np.zeros(16)] if initial is None else [initial]\n best=None\n for st in starts:\n  result=minimize(obj,st,method='SLSQP',bounds=bounds,constraints=[{'type':'ineq','fun':lambda a:100-np.sum((a*stds+means)[:12])}],options={'maxiter':1000,'ftol':1e-10})\n  if best is None or result.fun<best.fun:best=result\n return best\n\nif __name__=='__main__':\n for excludes in [[],['Si','Nb','Cu'],['Si','Nb','Cu','Ti']]:\n  inds=[i for i,n in enumerate(num) if n not in excludes]\n  xb=np.column_stack([z.iloc[:,inds],z.iloc[:,inds]**2,D]);xx=np.column_stack([xb,Xint])\n  model=SemiModel(nbase=xb.shape[1],alpha=1.5).fit(xx,y)\n  results=[]\n  for ht,rt in product(sorted(df.heat_treatment.unique()),sorted(df.route.unique())):\n   dc=pd.get_dummies(pd.DataFrame({'heat_treatment':[ht],'route':[rt]}),dtype=float).reindex(columns=D.columns,fill_value=0).values[0]\n   r=optimize(model,inds,dc)\n   results.append((r,ht,rt,dc))\n  results.sort(key=lambda t:t[0].fun)\n  print('\\nExcluded main effects',excludes)\n  for r,ht,rt,dc in results:print(ht,rt,-r.fun,r.success)\n  r,ht,rt,dc=results[0]\n  recipe=r.x*stds+means\n  print('Best recipe',dict(zip(num,np.round(recipe,5))))\n  print('Sum wt%',sum(recipe[:12]),'Prediction',-r.fun,flush=True)\n  print('Interactions',[(p,round(c,3)) for p,c in zip(pnames,model.m.coef_) if c!=0],flush=True)\n  if excludes==['Si','Nb','Cu']:\n   # Rounding to practical precision, flat Si/Nb dimensions at sample averages.\n   rounded=np.round(recipe,3);rounded[12:]=np.round(rounded[12:],1)\n   pred=model.predict(features((rounded-means)/stds,dc,inds))[0]\n   print('Rounded recipe',dict(zip(num,rounded)),'Prediction',pred,flush=True)\n   rng=np.random.default_rng(123);preds=[];optima=[]\n   for k in range(300):\n    sample=rng.integers(0,len(y),len(y));boot=SemiModel(nbase=xb.shape[1],alpha=1.5).fit(xx[sample],y[sample])\n    preds.append(boot.predict(features((rounded-means)/stds,dc,inds))[0])\n    if k<100:\n     br=optimize(boot,inds,dc,initial=r.x);optima.append(br.x*stds+means)\n   print('Bootstrap prediction percentiles',np.percentile(preds,[2.5,50,97.5]),flush=True)\n   print('Bootstrap recipe percentiles\\n',pd.DataFrame(np.percentile(optima,[10,50,90],axis=0).T,index=num,columns=['p10','median','p90']).round(3).to_string(),flush=True)\n"
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/optimize_alloy.py",
+            "timeout": 180
+          }
+        },
+        {
+          "name": "bash",
+          "arguments": {
+            "command": "OPENBLAS_NUM_THREADS=1 python - <<'PY'\nimport sys;sys.path.insert(0,'/tmp');from optimize_alloy import *\ninds=list(range(16));model=SemiModel(nbase=Xbase.shape[1],alpha=1.5).fit(X,y)\nrecipe=np.array([.493,.872,1.5,9.801,9.732,2.719,.558,.0003,6.312,.704,.691,3.,1075.7,667.8,14.9,57.8])\ndc=pd.get_dummies(pd.DataFrame({'heat_treatment':['solution_aged'],'route':['wrought']}),dtype=float).reindex(columns=D.columns,fill_value=0).values[0]\nassert np.all(recipe[:12]>=0) and recipe[:12].sum()<=100\nassert np.all(recipe>=Xn.min().values) and np.all(recipe<=Xn.max().values)\nprint('Predicted MPa:',model.predict(features((recipe-means)/stds,dc,inds))[0]);print('Total alloying wt%:',recipe[:12].sum())\nPY",
+            "timeout": 30
+          }
+        }
+      ],
+      "citations": [],
+      "trace": [
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "ls -la /work && python - <<'PY'\nimport importlib.util\nfor x in ['pandas','numpy','scipy','sklearn','xgboost','catboost']:\n print(x, bool(importlib.util.find_spec(x)))\nPY"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 246,
+          "text": "total 48\ndrwxr-xr-x 3 agent agent    96 Sep 15 08:46 .\ndrwxr-xr-x 1 root  root   4096 Sep 15 08:46 ..\n-rw-r--r-- 1 agent agent 44805 Jul 23 12:18 alloy_pair_max_train.csv\npandas True\nnumpy True\nscipy True\nsklearn True\nxgboost False\ncatboost True\n"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "read",
+          "args": {
+            "path": "/work/alloy_pair_max_train.csv",
+            "limit": "35"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "read",
+          "is_error": false,
+          "chars": 5188,
+          "text": "C,Mn,Si,Cr,Ni,Mo,V,Nb,Co,Al,Ti,Cu,Fe,solutionizing_temp,aging_temp,aging_time,cooling_rate,heat_treatment,route,target\r\n0.1109,2.0,1.433,7.5553,14.5323,0.6412,0.1684,0.1667,9.2963,0.2105,1.5,0.0602,62.325,1007.986,476.6591,38.7247,36.7148,solution_aged,wrought,541.5479\r\n0.7723,0.5019,0.0216,6.4352,2.2276,2.8905,0.6776,0.1722,10.9182,0.2528,0.9491,0.3009,73.8801,973.0516,673.3407,21.5033,87.1957,quenched,AM,480.9256\r\n0.4123,0.2187,0.1566,1.429,8.9775,2.8425,0.2061,0.0709,4.846,0.2493,0.7163,1.0946,78.7802,1218.9248,620.7208,9.1502,84.4011,quench_temper,cast,458.9608\r\n1.2,0.0021,0.0822,0.2832,11.4323,6,1.5,1.0,1.3827,2.0,1.5,3.0,70.6175,1187.6703,492.0948,9.7628,79.2768,solution_aged,cast,302.3137\r\n0.0536,0.2679,0.2648,0.246,7.8466,4.6027,0.3633,0.0649,6.453,0.2883,0.171,0.1394,79.2385,1089.836,577.4943,26.6951,80.0459,quench_temper,cast,411.1606\r\n0.3324,0.8773,0.001,5.8125,10.3988,0.9781,0.338,0.3783,0.9166,0.1498,0.4223,0.646,78.7488,1110.6042,550.3065,46.9117,28.8863,quench_temper,wrought,522.3836\r\n0.0317,0.432,0.0534,2.6183,2.1816,2.5106,0.7046,0.6247,15,2.0,1.5,1.3774,70.9658,1148.8583,614.9417,7.2485,54.6296,quench_temper,wrought,474.681\r\n1.2,0.3929,0.7162,11.2286,6.7277,0.0814,0.0276,1.0,15,0.9669,1.3582,0.6962,60.6042,1163.1143,735.2495,38.8875,46.5694,annealed,cast,173.7318\r\n0.3775,0.2971,0.7515,1.2372,16.7112,4.9329,0.0237,0.596,2.1297,1.0556,0.8922,2.9972,67.9982,1189.4208,551.6887,36.7717,14.7655,solution_aged,cast,456.6821\r\n0.2345,0.3386,1.5,1.0994,4.6964,0.8486,0.\n…[truncated 3688 chars]"
+        },
+        {
+          "kind": "assistant",
+          "stop_reason": "toolUse",
+          "text": "I’ll compare models on held-out data, then optimize the best-performing model while enforcing valid compositions and keeping processing parameters within the observed ranges.",
+          "thinking": "**Optimizing a synthetic function**\n\nI need to optimize the underlying synthetic function, which seems to involve a smooth quadratic and pair interactions. It looks like 300 is sufficient to identify what I'm looking for. I'm aiming for a reasonable time to explore the CV poly additive smooth. I have 27k tokens, but I’m wondering if I could push it to 28 or maybe 29k. Full data with pandas stats is essential for this process.",
+          "error": null
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "python - <<'PY'\nimport pandas as pd\np=pd.read_csv('alloy_pair_max_train.csv')\nprint('Shape:',p.shape,'\\nMissing:',p.isna().sum().sum())\nprint(p.describe().round(3).to_string())\nfor c in ['heat_treatment','route']:print(p.groupby(c).target.agg(['count','mean','std','min','max']).round(2))\nprint('\\nTop samples\\n',p.nlargest(12,'target').to_string(index=False))\nprint('\\nCorrelations\\n',p.corr(numeric_only=True).target.sort_values().round(3))\nPY"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 5246,
+          "text": "Shape: (300, 20) \nMissing: 0\n             C       Mn       Si       Cr       Ni       Mo        V       Nb       Co       Al       Ti       Cu       Fe  solutionizing_temp  aging_temp  aging_time  cooling_rate   target\ncount  300.000  300.000  300.000  300.000  300.000  300.000  300.000  300.000  300.000  300.000  300.000  300.000  300.000             300.000     300.000     300.000       300.000  300.000\nmean     0.487    0.799    0.601    8.844   10.201    2.511    0.622    0.422    6.115    0.835    0.623    1.207   66.734            1106.658     598.632      24.935        46.979  399.793\nstd      0.385    0.653    0.494    6.391    6.598    1.992    0.494    0.330    4.508    0.651    0.517    0.960    8.419              85.005      88.486      14.350        28.052  122.982\nmin      0.001    0.002    0.000    0.008    0.004    0.000    0.000    0.000    0.005    0.000    0.000    0.000   48.594             950.776     450.595       1.047         0.136   96.381\n25%      0.144    0.222    0.160    3.289    4.974    0.777    0.180    0.145    2.213    0.261    0.168    0.377   59.466            1033.759     520.384      12.672        22.968  317.780\n50%      0.392    0.609    0.534    7.881    9.897    1.940    0.513    0.340    5.165    0.672    0.464    0.967   67.458            1110.066     602.856      25.309        46.234  396.988\n75%      0.744    1.246    0.939   13.372   14.912    4.132    1.009    0.671    9.226    1.261    1.018    1.887   73.677            1178.68\n…[truncated 3746 chars]"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "write",
+          "args": {
+            "path": "/tmp/model_alloy.py",
+            "content": "import numpy as np,pandas as pd\nfrom sklearn.model_selection import KFold,cross_val_predict,GridSearchCV\nfrom sklearn.preprocessing import StandardScaler, PolynomialFeatures, SplineTransformer\nfrom sklearn.pipeline import make_pipeline\nfrom sklearn.linear_model import Ridge,LinearRegression,Lasso,ElasticNet\nfrom sklearn.metrics import mean_squared_error,r2_score\nfrom catboost import CatBoostRegressor\nfrom sklearn.ensemble import ExtraTreesRegressor,HistGradientBoostingRegressor\nimport warnings\nwarnings.filterwarnings('ignore')\ndf=pd.read_csv('/work/alloy_pair_max_train.csv')\nnum=[c for c in df.columns if c not in ['Fe','heat_treatment','route','target']]\ncat=['heat_treatment','route']\nXn=df[num]; D=pd.get_dummies(df[cat],drop_first=True,dtype=float)\ny=df.target.values\nz=(Xn-Xn.mean())/Xn.std()\nkf=KFold(5,shuffle=True,random_state=42)\n\ndef assess(name,X,model):\n pred=cross_val_predict(model,X,y,cv=kf,n_jobs=1)\n print(name,'RMSE',round(mean_squared_error(y,pred)**.5,3),'R2',round(r2_score(y,pred),4),flush=True)\n return pred\n\ndef grid(name,X,model,params):\n g=GridSearchCV(make_pipeline(StandardScaler(),model),params,cv=kf,scoring='neg_mean_squared_error',n_jobs=1)\n g.fit(X,y)\n print(name,g.best_params_,'RMSE',round((-g.best_score_)**.5,3),flush=True)\n return g\n\nif __name__=='__main__':\n print('Numeric columns',num)\n Xlin=np.column_stack([z,D])\n assess('Linear',Xlin,make_pipeline(StandardScaler(),Ridge(alpha=1)))\n Xquad=np.column_stack([z,z**2,D])\n m=grid('Additive quadratic',Xquad,Ridge(),{'ridge__alpha':[.001,.01,.1,1,10,100]})\n Xcub=np.column_stack([z,z**2,z**3,D])\n grid('Additive cubic',Xcub,Ridge(),{'ridge__alpha':[.01,.1,1,10,100]})\n Xspline=np.column_stack([SplineTransformer(n_knots=4,degree=3).fit_transform(z),D])\n grid('Additive splines',Xspline,Ridge(),{'ridge__alpha':[.001,.01,.1,1,10,100]})\n Xpoly=PolynomialFeatures(2,include_bias=False).fit_transform(Xlin)\n grid('Full quadratic ridge',Xpoly,Ridge(),{'ridge__alpha':[.01,.1,1,3,10,30,100,300,1000]})\n grid('Full quadratic lasso',Xpoly,Lasso(max_iter=20000),{'lasso__alpha':[.1,.3,1,2,3,5,10]})\n # Include categorical interaction but not numerics\n Xcatquad=np.column_stack([z,z**2,PolynomialFeatures(2,include_bias=False,interaction_only=True).fit_transform(D)])\n grid('Additive quadratic + cat interaction',Xcatquad,Ridge(),{'ridge__alpha':[.001,.01,.1,1,10,100]})\n for depth in [3,4,5,6]:\n  model=CatBoostRegressor(iterations=1200,depth=depth,learning_rate=.03,l2_leaf_reg=5,loss_function='RMSE',cat_features=cat,verbose=False,thread_count=2)\n  assess('Catboost depth '+str(depth),df[num+cat],model)\n # Coefficients of add quad\n model=make_pipeline(StandardScaler(),Ridge(alpha=.01)).fit(Xquad,y)\n co=model[-1].coef_/model[0].scale_\n print('Quadratic coefs standardized features:\\n',pd.DataFrame({'linear':co[:16],'quadratic':co[16:32]},index=num).round(3).to_string())\n print('Categoricals',list(zip(D.columns,co[32:])))\n resid=y-model.predict(Xquad)\n print('Training additive quadratic RMSE',np.sqrt(np.mean(resid**2)))\n"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "write",
+          "is_error": false,
+          "chars": 52,
+          "text": "Successfully wrote 3014 bytes to /tmp/model_alloy.py"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/model_alloy.py",
+            "timeout": "240"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": true,
+          "chars": 2763,
+          "text": "Numeric columns ['C', 'Mn', 'Si', 'Cr', 'Ni', 'Mo', 'V', 'Nb', 'Co', 'Al', 'Ti', 'Cu', 'solutionizing_temp', 'aging_temp', 'aging_time', 'cooling_rate']\nLinear RMSE 47.639 R2 0.8494\nAdditive quadratic {'ridge__alpha': 0.1} RMSE 19.088\nAdditive cubic {'ridge__alpha': 1} RMSE 19.775\nAdditive splines {'ridge__alpha': 1} RMSE 21.871\nFull quadratic ridge {'ridge__alpha': 3} RMSE 38.209\nFull quadratic lasso {'lasso__alpha': 1} RMSE 19.635\nAdditive quadratic + cat interaction {'ridge__alpha': 1} RMSE 19.341\nTraceback (most recent call last):\n  File \"/tmp/model_alloy.py\", line 48, in <module>\n    assess('Catboost depth '+str(depth),df[num+cat],model)\n  File \"/tmp/model_alloy.py\", line 20, in assess\n    pred=cross_val_predict(model,X,y,cv=kf,n_jobs=1)\n         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/site-packages/sklearn/utils/_param_validation.py\", line 218, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/site-packages/sklearn/model_selection/_validation.py\", line 1240, in cross_val_predict\n    predictions = parallel(\n                  ^^^^^^^^^\n  File \"/usr/local/lib/python3.12/site-packages/sklearn/utils/parallel.py\", line 91, in __call__\n    return super().__call__(iterable_with_config_and_warning_filters)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.12/site-packages/joblib/parallel.py\", line 1986, in __call__\n    return outpu\n…[truncated 1263 chars]"
+        },
+        {
+          "kind": "assistant",
+          "stop_reason": "toolUse",
+          "text": "",
+          "thinking": "**Analyzing interaction terms**\n\nI'm looking at the additive quad, which is already great. I think I need an interaction term called \"alloy_pair_max,\" as it might optimize the interior. The RMSE is around 19, but I'm wondering if there's noise affecting the function regarding quadratics. I'll need to check the coefficients and residuals, review the cat manual for cross-validation, and consider validation for pair selection. There’s a lot to unpack here!",
+          "error": null
+        },
+        {
+          "kind": "tool_call",
+          "tool": "edit",
+          "args": {
+            "path": "/tmp/model_alloy.py",
+            "edits": "[{'oldText': \"  assess('Catboost depth '+str(depth),df[num+cat],model)\", 'newText': \"  pred=np.zeros(len(y))\\n  for tr,te in kf.split(df):\\n   model.fit(df[num+cat].iloc[tr],y[tr])\\n   pred[te]=model.predict(df[num+cat].iloc[te])\\n  print('Catboost depth',depth,'RMSE',round(mean_squared_error(y,pred)**.5,3),flush=True)\"}]"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "edit",
+          "is_error": false,
+          "chars": 56,
+          "text": "Successfully replaced 1 block(s) in /tmp/model_alloy.py."
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/model_alloy.py",
+            "timeout": "240"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 1662,
+          "text": "Numeric columns ['C', 'Mn', 'Si', 'Cr', 'Ni', 'Mo', 'V', 'Nb', 'Co', 'Al', 'Ti', 'Cu', 'solutionizing_temp', 'aging_temp', 'aging_time', 'cooling_rate']\nLinear RMSE 47.639 R2 0.8494\nAdditive quadratic {'ridge__alpha': 0.1} RMSE 19.088\nAdditive cubic {'ridge__alpha': 1} RMSE 19.775\nAdditive splines {'ridge__alpha': 1} RMSE 21.871\nFull quadratic ridge {'ridge__alpha': 3} RMSE 38.209\nFull quadratic lasso {'lasso__alpha': 1} RMSE 19.635\nAdditive quadratic + cat interaction {'ridge__alpha': 1} RMSE 19.341\nCatboost depth 3 RMSE 30.619\nCatboost depth 4 RMSE 32.72\nCatboost depth 5 RMSE 36.346\nCatboost depth 6 RMSE 40.703\nQuadratic coefs standardized features:\n                     linear  quadratic\nC                    0.699    -13.766\nMn                   3.888    -13.395\nSi                   0.788      0.464\nCr                   3.561    -13.053\nNi                  -1.002     -7.535\nMo                   2.544    -16.845\nV                   -3.814    -14.810\nNb                  -2.234      2.249\nCo                   0.774    -10.353\nAl                  -6.262    -14.104\nTi                   0.694     -3.317\nCu                   1.135      0.046\nsolutionizing_temp  -7.635    -10.465\naging_temp          12.943     -9.119\naging_time         -17.564    -12.915\ncooling_rate         8.742    -10.997\nCategoricals [('heat_treatment_quench_temper', np.float64(152.22238239717495)), ('heat_treatment_quenched', np.float64(84.05615934630661)), ('heat_treatment_solution_aged', np.float64(242.25670\n…[truncated 162 chars]"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 python - <<'PY'\nimport sys\nsys.path.insert(0,'/tmp');from model_alloy import *\nfrom itertools import combinations\nimport scipy.stats as st\nX=np.column_stack([np.ones(len(y)),z,z**2,D]);names=['intercept']+num+[x+'^2' for x in num]+list(D.columns)\ncoef=np.linalg.lstsq(X,y,rcond=None)[0];res=y-X@coef;dfree=len(y)-len(coef);sd=np.sqrt(np.diag(np.linalg.inv(X.T@X))*sum(res**2)/dfree)\nprint(pd.DataFrame({'coef':coef,'std':sd,'p':2*st.t.sf(abs(coef/sd),dfree)},index=names).round(4).to_string())\npairs=list(combinations(range(16),2));Xint=np.column_stack([z.iloc[:,i]*z.iloc[:,j] for i,j in pairs]);Xir=Xint-X@np.linalg.lstsq(X,Xint,rcond=None)[0]\nci=Xir.T@res/(Xir**2).sum(axis=0);se=np.sqrt(((res[:,None]-Xir*ci)**2).sum(axis=0)/(dfree-1)/(Xir**2).sum(axis=0))\nt=ci/se\nprint('\\nTop interactions:\\n',pd.DataFrame({'coef':ci,'std':se,'p':2*st.t.sf(abs(t),dfree-1)},index=[num[i]+' * '+num[j] for i,j in pairs]).sort_values('p').head(30).round(5).to_string())\nprint('\\nMax for additive model:')\nxmax={}\nfor i,c in enumerate(num):\n b=coef[1+i];a=coef[17+i]\n lb=z[c].min();ub=z[c].max()\n zs=np.array([lb,ub]+([-b/(2*a)] if a<0 and lb<-b/(2*a)<ub else []))\n zv=zs[np.argmax(a*zs**2+b*zs)]\n xmax[c]=zv*Xn[c].std()+Xn[c].mean()\nprint(xmax)\nxz=(pd.DataFrame([xmax])[num]-Xn.mean())/Xn.std();ds=D.loc[(df.heat_treatment=='solution_aged')&(df.route=='wrought')].iloc[[0]].values\nxx=np.column_stack([np.ones(1),xz,xz**2,ds]);print('Prediction',xx@coef,'sum alloys',sum(xmax[c] for c in num[:12]))\nprint('Residual corr with target',np.corrcoef(y,res)[0,1])\nPY"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 4485,
+          "text": "                                  coef     std       p\nintercept                     421.2247  5.1169  0.0000\nC                               0.6994  1.3141  0.5950\nMn                              3.8896  1.3639  0.0047\nSi                              0.7880  1.2860  0.5406\nCr                              3.5622  1.3566  0.0092\nNi                             -1.0027  1.2375  0.4185\nMo                              2.5443  1.3295  0.0567\nV                              -3.8138  1.3322  0.0045\nNb                             -2.2340  1.2785  0.0817\nCo                              0.7735  1.3050  0.5539\nAl                             -6.2621  1.3549  0.0000\nTi                              0.6931  1.3442  0.6066\nCu                              1.1358  1.3335  0.3951\nsolutionizing_temp             -7.6352  1.0757  0.0000\naging_temp                     12.9437  1.1107  0.0000\naging_time                    -17.5652  1.1048  0.0000\ncooling_rate                    8.7425  1.1086  0.0000\nC^2                           -13.7663  1.3128  0.0000\nMn^2                          -13.3967  1.3399  0.0000\nSi^2                            0.4640  1.2865  0.7187\nCr^2                          -13.0534  1.1644  0.0000\nNi^2                           -7.5358  1.0299  0.0000\nMo^2                          -16.8461  1.3975  0.0000\nV^2                           -14.8103  1.3199  0.0000\nNb^2                            2.2498  1.3528  0.0975\nCo^2                          -10.3523  1.1832  0.0000\nAl^2           \n…[truncated 2985 chars]"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "write",
+          "args": {
+            "path": "/tmp/refine_alloy.py",
+            "content": "exec(open('/tmp/model_alloy.py').read().split(\"if __name__=='__main__':\")[0])\nfrom itertools import combinations\nfrom sklearn.base import BaseEstimator,RegressorMixin\nfrom scipy import stats\nfrom sklearn.model_selection import RepeatedKFold\n\nclass SemiModel(RegressorMixin,BaseEstimator):\n def __init__(self,nbase,alpha=1,kind='lasso',ratio=1):\n  self.nbase=nbase;self.alpha=alpha;self.kind=kind;self.ratio=ratio\n def fit(self,X,y):\n  self.s=StandardScaler().fit(X);X=self.s.transform(X)\n  A=np.column_stack([np.ones(len(X)),X[:,:self.nbase]]);B=X[:,self.nbase:]\n  self.proj=np.linalg.lstsq(A,B,rcond=None)[0];R=B-A@self.proj\n  self.base=np.linalg.lstsq(A,y,rcond=None)[0];yr=y-A@self.base\n  if self.kind=='lasso': self.m=Lasso(alpha=self.alpha,fit_intercept=False,max_iter=10000)\n  elif self.kind=='ridge': self.m=Ridge(alpha=self.alpha,fit_intercept=False)\n  else:self.m=ElasticNet(alpha=self.alpha,l1_ratio=self.ratio,fit_intercept=False,max_iter=10000)\n  self.m.fit(R,yr)\n  return self\n def predict(self,X):\n  X=self.s.transform(X);A=np.column_stack([np.ones(len(X)),X[:,:self.nbase]]);R=X[:,self.nbase:]-A@self.proj\n  return A@self.base+self.m.predict(R)\n\nXbase=np.column_stack([z,z**2,D]);nb=Xbase.shape[1]\npairs=list(combinations(range(16),2))\nXint=np.column_stack([z.iloc[:,i]*z.iloc[:,j] for i,j in pairs]);pnames=[num[i]+' * '+num[j] for i,j in pairs]\nX=np.column_stack([Xbase,Xint])\nif __name__=='__main__':\n cv=RepeatedKFold(n_splits=5,n_repeats=3,random_state=42)\n for kind,alphas in [('lasso',[.25,.5,.75,1,1.5,2,3,4,6]),('ridge',[10,30,100,300,1000,3000,10000]),('elastic',[.1,.3,1,3,10])]:\n  g=GridSearchCV(SemiModel(nbase=nb,kind=kind,ratio=.5),{'alpha':alphas},cv=cv,scoring='neg_mean_squared_error',n_jobs=1).fit(X,y)\n  print(kind,g.best_params_,'RMSE',(-g.best_score_)**.5,flush=True)\n  print([(d,round(np.sqrt(-v),3)) for d,v in zip(g.cv_results_['params'],g.cv_results_['mean_test_score'])],flush=True)\n  if kind=='lasso':\n   model=g.best_estimator_\n   print('Nonzero interactions',[(p,round(c,3)) for p,c in zip(pnames,model.m.coef_) if c!=0],flush=True)\n   import joblib\n   joblib.dump(model,'/tmp/alloy_semimodel.joblib')\n # allow categorical-numeric and categorical pair effects also\n Xintextra=np.column_stack([Xint]+[z.iloc[:,i].values*D.iloc[:,j].values for i in range(16) for j in range(D.shape[1])]+[D.iloc[:,i]*D.iloc[:,j] for i,j in combinations(range(D.shape[1]),2)])\n g=GridSearchCV(SemiModel(nbase=nb),{'alpha':[.5,1,1.5,2,3,4,6]},cv=cv,scoring='neg_mean_squared_error',n_jobs=1).fit(np.column_stack([Xbase,Xintextra]),y)\n print('All interactions semi-lasso',g.best_params_,'RMSE',(-g.best_score_)**.5,flush=True)\n extra=pnames+[n+' * '+d for n in num for d in D.columns]+[D.columns[i]+' * '+D.columns[j] for i,j in combinations(range(D.shape[1]),2)]\n print([(p,round(c,3)) for p,c in zip(extra,g.best_estimator_.m.coef_) if c!=0],flush=True)\n # restricted additive model remove clearly insignificant axes\n for excludes in [[],['Si','Nb','Cu'],['Si','Nb','Cu','Ti']]:\n  indices=[i for i,n in enumerate(num) if n not in excludes]\n  xb=np.column_stack([z.iloc[:,indices],z.iloc[:,indices]**2,D]);xx=np.column_stack([xb,Xint])\n  g=GridSearchCV(SemiModel(nbase=xb.shape[1]),{'alpha':[.5,1,1.5,2,3,4,6]},cv=cv,scoring='neg_mean_squared_error',n_jobs=1).fit(xx,y)\n  print('Remove',excludes,'semi-lasso',g.best_params_,'RMSE',(-g.best_score_)**.5,flush=True)\n"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "write",
+          "is_error": false,
+          "chars": 53,
+          "text": "Successfully wrote 3388 bytes to /tmp/refine_alloy.py"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/refine_alloy.py",
+            "timeout": "180"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 1968,
+          "text": "lasso {'alpha': 1.5} RMSE 18.22313939633463\n[({'alpha': 0.25}, np.float64(19.816)), ({'alpha': 0.5}, np.float64(18.892)), ({'alpha': 0.75}, np.float64(18.525)), ({'alpha': 1}, np.float64(18.354)), ({'alpha': 1.5}, np.float64(18.223)), ({'alpha': 2}, np.float64(18.329)), ({'alpha': 3}, np.float64(19.017)), ({'alpha': 4}, np.float64(19.253)), ({'alpha': 6}, np.float64(19.262))]\nNonzero interactions [('C * Cr', np.float64(-1.811)), ('C * Nb', np.float64(0.255)), ('Mn * cooling_rate', np.float64(-1.842)), ('Cr * Co', np.float64(1.42)), ('Cr * Al', np.float64(-0.562)), ('Ni * Co', np.float64(-0.772)), ('Ni * Ti', np.float64(-0.767)), ('Mo * Co', np.float64(-2.45)), ('Mo * Cu', np.float64(0.639)), ('Co * Ti', np.float64(0.073)), ('Al * cooling_rate', np.float64(-0.099)), ('aging_temp * aging_time', np.float64(-1.743))]\nridge {'alpha': 300} RMSE 18.38098984373892\n[({'alpha': 10}, np.float64(22.44)), ({'alpha': 30}, np.float64(20.129)), ({'alpha': 100}, np.float64(18.733)), ({'alpha': 300}, np.float64(18.381)), ({'alpha': 1000}, np.float64(18.624)), ({'alpha': 3000}, np.float64(18.952)), ({'alpha': 10000}, np.float64(19.153))]\nelastic {'alpha': 1} RMSE 18.25000016501891\n[({'alpha': 0.1}, np.float64(20.956)), ({'alpha': 0.3}, np.float64(19.015)), ({'alpha': 1}, np.float64(18.25)), ({'alpha': 3}, np.float64(18.623)), ({'alpha': 10}, np.float64(19.262))]\nAll interactions semi-lasso {'alpha': 2} RMSE 18.368281566089358\n[('C * Cr', np.float64(-1.471)), ('Mn * cooling_rate', np.float64(-1.\n…[truncated 468 chars]"
+        },
+        {
+          "kind": "assistant",
+          "stop_reason": "toolUse",
+          "text": "",
+          "thinking": "**Evaluating model choices**\n\nI need to choose the best model that excludes Ti and examine how its effect influences the quadratic aspect. Excluding some terms unexpectedly improves results, possibly because six terms are irrelevant. I wonder if a robust model could use Ridge with additive terms independently and apply Bayesian techniques for relevance determination. I’ll test Bayesian ARDRegression and Huber to see how they fit. I also need to look out for any systematic residual signs at extremes related to composition. Plus, I’ll check the relationship between aging, temperature, and time.**Optimizing the model**\n\nI need to optimize around a reliable main shape. I could consider using a Gaussian Process with a quadratic parametric approach and learned RBF residuals to improve RMSE for non-linear effects, though small. 300 variables might be expensive but manageable. Running a 5-fold GP takes about 10 seconds on one thread, which isn't necessary. Instead, I’ll focus on fully standardized polynomial features across 153 numeric terms plus some dummies, utilizing Bayesian evidence shrinkage. The most important parts will be selecting main second powers, with a few interactions.",
+          "error": null
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python - <<'PY'\nimport sys;sys.path.insert(0,'/tmp');from refine_alloy import *\nfrom sklearn.linear_model import ARDRegression,BayesianRidge\nfrom sklearn.model_selection import cross_val_score\ncv=RepeatedKFold(n_splits=5,n_repeats=3,random_state=42)\nfor thresh in [100,1000,10000,100000]:\n model=make_pipeline(StandardScaler(),ARDRegression(threshold_lambda=thresh,max_iter=1000,tol=.001))\n scores=cross_val_score(model,X,y,cv=cv,scoring='neg_mean_squared_error')\n print('ARD thresh',thresh,'RMSE',np.sqrt(-scores.mean()),flush=True)\n if thresh==10000:\n  model.fit(X,y);coef=model[-1].coef_/model[0].scale_\n  names=num+[n+'^2' for n in num]+list(D.columns)+pnames\n  print([(n,round(v,3)) for n,v in zip(names,coef) if v!=0])\n  import joblib;joblib.dump(model,'/tmp/alloy_ard.joblib')\nPY",
+            "timeout": "180"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 5827,
+          "text": "ARD thresh 100 RMSE 19.121436302641076\nARD thresh 1000 RMSE 19.438096574283357\nARD thresh 10000 RMSE 19.8295880761595\n[('C', np.float64(0.005)), ('Mn', np.float64(2.664)), ('Si', np.float64(0.0)), ('Cr', np.float64(3.513)), ('Ni', np.float64(-0.0)), ('Mo', np.float64(2.102)), ('V', np.float64(-4.421)), ('Nb', np.float64(-1.741)), ('Co', np.float64(1.123)), ('Al', np.float64(-5.316)), ('Ti', np.float64(0.001)), ('Cu', np.float64(0.0)), ('solutionizing_temp', np.float64(-7.179)), ('aging_temp', np.float64(14.8)), ('aging_time', np.float64(-16.845)), ('cooling_rate', np.float64(7.739)), ('C^2', np.float64(-14.621)), ('Mn^2', np.float64(-13.598)), ('Si^2', np.float64(0.0)), ('Cr^2', np.float64(-13.413)), ('Ni^2', np.float64(-9.78)), ('Mo^2', np.float64(-16.495)), ('V^2', np.float64(-15.989)), ('Nb^2', np.float64(0.001)), ('Co^2', np.float64(-11.635)), ('Al^2', np.float64(-14.378)), ('Ti^2', np.float64(-0.513)), ('Cu^2', np.float64(-0.0)), ('solutionizing_temp^2', np.float64(-10.923)), ('aging_temp^2', np.float64(-9.961)), ('aging_time^2', np.float64(-13.111)), ('cooling_rate^2', np.float64(-10.663)), ('heat_treatment_quench_temper', np.float64(148.385)), ('heat_treatment_quenched', np.float64(80.892)), ('heat_treatment_solution_aged', np.float64(240.198)), ('route_cast', np.float64(-58.953)), ('route_wrought', np.float64(66.685)), ('C * Mn', np.float64(-0.0)), ('C * Si', np.float64(-0.001)), ('C * Cr', np.float64(-3.142)), ('C * Ni', np.float64(-0.002)), ('C * Mo', np.float64(0.0\n…[truncated 4327 chars]"
+        },
+        {
+          "kind": "assistant",
+          "stop_reason": "toolUse",
+          "text": "A regularized quadratic model with selected pairwise interactions performed best, with cross-validation RMSE of about 18 MPa. I’ll use it to optimize the recipe and compare all heat-treatment/route combinations; the categorical effects favor solution aging and the wrought route.",
+          "thinking": "**Evaluating data optimization**\n\nI want to compute optimizations and explore uncertainties in predictions, aiming for a strong yet feasible outcome. I'm wondering about the balance between sparse quadratics and Gaussian processes—does 0.2% strength seem overly ambitious? It’s crucial to analyze the per-scaled slopes for regularity, especially regarding the interaction between chromium and cobalt versus the omitted iron data. I might need to consider adjusting for high collinearity and interactions. Lastly, maybe cross-validation could help reduce noise across major fields and improve the model.**Analyzing optimization models**\n\nI'm comparing quadratic CV19 to cubic 19.8, likely favoring the exact quadratic. The signal from semilasso CV18 seems random, so I need to ensure my optimizations avoid unseen high compositions, particularly with 36 Fe64 support. I'll calculate an optimal model using SLSQP with multiple starting points, ensuring the sum is less than or equal to 100. I'm aware that while the composition sum constraint may seem redundant, it's essential for validation. I want to stay within sensible observed bounds and employ a quadratic ridge with selected interactions.",
+          "error": null
+        },
+        {
+          "kind": "tool_call",
+          "tool": "write",
+          "args": {
+            "path": "/tmp/optimize_alloy.py",
+            "content": "import sys\nsys.path.insert(0,'/tmp')\nfrom refine_alloy import *\nfrom scipy.optimize import minimize\nfrom itertools import product\n\nmeans=Xn.mean().values;stds=Xn.std().values\nbounds=[(float(z[c].min()),float(z[c].max())) for c in num]\n\ndef features(zz,dc,indices):\n zz=np.atleast_2d(zz);dd=np.tile(dc,(len(zz),1))\n return np.column_stack([zz[:,indices],zz[:,indices]**2,dd]+[zz[:,i]*zz[:,j] for i,j in pairs])\n\ndef optimize(model,indices,dc,initial=None):\n def obj(zz):return -float(model.predict(features(zz,dc,indices))[0])\n starts=[np.zeros(16)] if initial is None else [initial]\n best=None\n for st in starts:\n  result=minimize(obj,st,method='SLSQP',bounds=bounds,constraints=[{'type':'ineq','fun':lambda a:100-np.sum((a*stds+means)[:12])}],options={'maxiter':1000,'ftol':1e-10})\n  if best is None or result.fun<best.fun:best=result\n return best\n\nif __name__=='__main__':\n for excludes in [[],['Si','Nb','Cu'],['Si','Nb','Cu','Ti']]:\n  inds=[i for i,n in enumerate(num) if n not in excludes]\n  xb=np.column_stack([z.iloc[:,inds],z.iloc[:,inds]**2,D]);xx=np.column_stack([xb,Xint])\n  model=SemiModel(nbase=xb.shape[1],alpha=1.5).fit(xx,y)\n  results=[]\n  for ht,rt in product(sorted(df.heat_treatment.unique()),sorted(df.route.unique())):\n   dc=pd.get_dummies(pd.DataFrame({'heat_treatment':[ht],'route':[rt]}),dtype=float).reindex(columns=D.columns,fill_value=0).values[0]\n   r=optimize(model,inds,dc)\n   results.append((r,ht,rt,dc))\n  results.sort(key=lambda t:t[0].fun)\n  print('\\nExcluded main effects',excludes)\n  for r,ht,rt,dc in results:print(ht,rt,-r.fun,r.success)\n  r,ht,rt,dc=results[0]\n  recipe=r.x*stds+means\n  print('Best recipe',dict(zip(num,np.round(recipe,5))))\n  print('Sum wt%',sum(recipe[:12]),'Prediction',-r.fun,flush=True)\n  print('Interactions',[(p,round(c,3)) for p,c in zip(pnames,model.m.coef_) if c!=0],flush=True)\n  if excludes==['Si','Nb','Cu']:\n   # Rounding to practical precision, flat Si/Nb dimensions at sample averages.\n   rounded=np.round(recipe,3);rounded[12:]=np.round(rounded[12:],1)\n   pred=model.predict(features((rounded-means)/stds,dc,inds))[0]\n   print('Rounded recipe',dict(zip(num,rounded)),'Prediction',pred,flush=True)\n   rng=np.random.default_rng(123);preds=[];optima=[]\n   for k in range(300):\n    sample=rng.integers(0,len(y),len(y));boot=SemiModel(nbase=xb.shape[1],alpha=1.5).fit(xx[sample],y[sample])\n    preds.append(boot.predict(features((rounded-means)/stds,dc,inds))[0])\n    if k<100:\n     br=optimize(boot,inds,dc,initial=r.x);optima.append(br.x*stds+means)\n   print('Bootstrap prediction percentiles',np.percentile(preds,[2.5,50,97.5]),flush=True)\n   print('Bootstrap recipe percentiles\\n',pd.DataFrame(np.percentile(optima,[10,50,90],axis=0).T,index=num,columns=['p10','median','p90']).round(3).to_string(),flush=True)\n"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "write",
+          "is_error": false,
+          "chars": 55,
+          "text": "Successfully wrote 2783 bytes to /tmp/optimize_alloy.py"
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 python /tmp/optimize_alloy.py",
+            "timeout": "180"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 5862,
+          "text": "\nExcluded main effects []\nsolution_aged wrought 756.4170241782306 True\nsolution_aged AM 690.0272450864408 True\nquench_temper wrought 665.6076387913258 True\nsolution_aged cast 630.8455547865186 True\nquench_temper AM 599.2178596994655 True\nquenched wrought 598.2325401143434 True\nquench_temper cast 540.0361693995168 True\nquenched AM 531.8427610225688 True\nannealed wrought 514.5443867254089 True\nquenched cast 472.66107072263134 True\nannealed AM 448.15460763363205 True\nannealed cast 388.9729173337039 True\nBest recipe {'C': np.float64(0.49287), 'Mn': np.float64(0.87231), 'Si': np.float64(1.5), 'Cr': np.float64(9.801), 'Ni': np.float64(9.73216), 'Mo': np.float64(2.71857), 'V': np.float64(0.55802), 'Nb': np.float64(0.0003), 'Co': np.float64(6.31184), 'Al': np.float64(0.70417), 'Ti': np.float64(0.69079), 'Cu': np.float64(3.0), 'solutionizing_temp': np.float64(1075.71102), 'aging_temp': np.float64(667.77612), 'aging_time': np.float64(14.87489), 'cooling_rate': np.float64(57.79832)}\nSum wt% 36.382028367215206 Prediction 756.4170241782306\nInteractions [('C * Cr', np.float64(-1.811)), ('C * Nb', np.float64(0.255)), ('Mn * cooling_rate', np.float64(-1.842)), ('Cr * Co', np.float64(1.42)), ('Cr * Al', np.float64(-0.562)), ('Ni * Co', np.float64(-0.772)), ('Ni * Ti', np.float64(-0.767)), ('Mo * Co', np.float64(-2.45)), ('Mo * Cu', np.float64(0.639)), ('Co * Ti', np.float64(0.073)), ('Al * cooling_rate', np.float64(-0.099)), ('aging_temp * aging_time', np.float64(-1.743))]\n\nExcluded main effe\n…[truncated 4362 chars]"
+        },
+        {
+          "kind": "assistant",
+          "stop_reason": "toolUse",
+          "text": "",
+          "thinking": "**Validating conditions**\n\nI need to ensure that the total is less than or equal to 100. I’m checking the predicted need after rounding to the nearest whole number. There's the observed composition involving Nbmin.0003, which rounds down to .000 if I choose 0 as valid. It’s important to provide the correct commentary for what’s observed at .0003. I want to keep everything precise and accurate in my calculations!**Analyzing models and predictions**\n\nI'm evaluating a model related to yield strength and considering whether to use a full model or a reduced one. It seems like the regularized quadratic regression performs well, achieving an RMSE of around 18 MPa, which is decent. The predicted yield strength is about 756 MPa, but I'm not entirely sure if this is the best representation. The user wants a complete recipe to maximize yield, but I've already done enough analysis. I need to ensure I finalize the \"best-performing\" model before moving into optimization.",
+          "error": null
+        },
+        {
+          "kind": "tool_call",
+          "tool": "bash",
+          "args": {
+            "command": "OPENBLAS_NUM_THREADS=1 python - <<'PY'\nimport sys;sys.path.insert(0,'/tmp');from optimize_alloy import *\ninds=list(range(16));model=SemiModel(nbase=Xbase.shape[1],alpha=1.5).fit(X,y)\nrecipe=np.array([.493,.872,1.5,9.801,9.732,2.719,.558,.0003,6.312,.704,.691,3.,1075.7,667.8,14.9,57.8])\ndc=pd.get_dummies(pd.DataFrame({'heat_treatment':['solution_aged'],'route':['wrought']}),dtype=float).reindex(columns=D.columns,fill_value=0).values[0]\nassert np.all(recipe[:12]>=0) and recipe[:12].sum()<=100\nassert np.all(recipe>=Xn.min().values) and np.all(recipe<=Xn.max().values)\nprint('Predicted MPa:',model.predict(features((recipe-means)/stds,dc,inds))[0]);print('Total alloying wt%:',recipe[:12].sum())\nPY",
+            "timeout": "30"
+          }
+        },
+        {
+          "kind": "tool_result",
+          "tool": "bash",
+          "is_error": false,
+          "chars": 61,
+          "text": "Predicted MPa: 756.4169755505983\nTotal alloying wt%: 36.3823\n"
+        },
+        {
+          "kind": "assistant",
+          "stop_reason": "stop",
+          "text": "**Predicted yield strength: approximately 756 MPa.**\n\nA regularized quadratic model with pairwise interactions achieved approximately **18 MPa cross-validation RMSE**. The recipe below maximizes its prediction within the observed feature ranges. Alloying elements total **36.3823 wt%**, satisfying the composition constraints.\n\nFinal: C=0.493, Mn=0.872, Si=1.500, Cr=9.801, Ni=9.732, Mo=2.719, V=0.558,\nNb=0.0003, Co=6.312, Al=0.704, Ti=0.691, Cu=3.000, solutionizing_temp=1075.7,\naging_temp=667.8, aging_time=14.9, cooling_rate=57.8,\nheat_treatment=solution_aged, route=wrought",
+          "thinking": "",
+          "error": null
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 45,
+        "completion_tokens": 7728,
+        "cost_usd": 0.8212955,
+        "latency_ms": 237951
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 45,
+    "completion_tokens": 7728,
+    "cost_usd": 0.8212955,
+    "latency_ms": 237951
+  },
+  "adapter_capabilities": {
+    "text": true,
+    "file_upload": true,
+    "file_output": false,
+    "tool_trajectory": true,
+    "web": false,
+    "code_exec": true,
+    "manual": true
+  },
+  "provenance": {
+    "harness": "pi",
+    "harness_version": "0.84.3-cat1",
+    "model_requested": "openai/gpt-6-astra",
+    "thinking": "high",
+    "models_seen": [
+      "openai/gpt-6-astra"
+    ],
+    "argv": [
+      "docker",
+      "run",
+      "--rm",
+      "--network=hm-int",
+      "--cpus=2",
+      "--memory=3g",
+      "-v",
+      "<repo_root>/harness_workspaces/pi_openai-gpt-6-astra/e2e_oracle_point__seed0:/work",
+      "-w",
+      "/work",
+      "-e",
+      "OPENROUTER_API_KEY=sandbox-placeholder",
+      "hallmark-harness:pi-0.84.3-cat1",
+      "pi",
+      "-p",
+      "--mode",
+      "json",
+      "--no-session",
+      "-nc",
+      "-ne",
+      "-ns",
+      "-np",
+      "--no-themes",
+      "-na",
+      "--offline",
+      "--provider",
+      "openrouter",
+      "--model",
+      "openai/gpt-6-astra",
+      "--thinking",
+      "high",
+      "--"
+    ],
+    "preamble_version": "v1",
+    "prompt_sha256": "bee05b28dd4d6c0e57972d5926b4a6354af6c5cd7c68c39bb1fae98ba22497f4",
+    "attempts": [
+      {
+        "attempt": 0,
+        "returncode": 0,
+        "final_stop_reason": "stop",
+        "errors": [],
+        "stderr_tail": ""
+      }
+    ],
+    "workspace": "<repo_root>/harness_workspaces/pi_openai-gpt-6-astra/e2e_oracle_point__seed0",
+    "files_created_by_agent": [
+      "catboost_info/catboost_training.json",
+      "catboost_info/learn/events.out.tfevents",
+      "catboost_info/learn_error.tsv",
+      "catboost_info/time_left.tsv"
+    ],
+    "cache_read_tokens": 158008,
+    "cache_write_tokens": 22115,
+    "reasoning_tokens": 2566,
+    "n_tool_calls": 14,
+    "n_tool_errors": 1,
+    "thinking_chars": 4247,
+    "final_stop_reason": "stop",
+    "n_task_calls": null,
+    "cost_incomplete": null,
+    "harness_cost_usd": 0.8212955,
+    "cost_at_ledger_prices_usd": 0.38685,
+    "run_dir": "<repo_root>/harness_runs/pi_openai-gpt-6-astra/e2e_oracle_point__seed0"
+  },
+  "schema_version": 1
+}

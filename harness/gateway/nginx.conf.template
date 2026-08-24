@@ -1,0 +1,81 @@
+# TEMPLATE. The key is substituted for __OPENROUTER_API_KEY__ when the gateway is brought
+# up — the rendered config with the key is never written to the repository.
+# Egress gateway of the harness sandbox.
+#
+# The SUT container sits in the hm-int network (--internal, no outbound route at all) and
+# sees exactly this host. The gateway is attached to both networks and proxies EXACTLY one
+# upstream — https://openrouter.ai/api/v1/. Everything else gets 403.
+#
+# The real OpenRouter key lives here, not in the agent container: Authorization is set
+# below, so the agent physically cannot exfiltrate the key.
+#
+# The egress log is an auditable record for anti-contamination: EVERY outbound request
+# from the sandbox is visible there.
+events {}
+
+http {
+  log_format audit '$time_iso8601 $remote_addr "$request" $status $body_bytes_sent';
+  # To stdout — so all egress is visible via `docker logs hallmark-gw`,
+  # without docker exec into the container.
+  access_log /dev/stdout audit;
+  error_log  /var/log/nginx/error.log warn;
+
+  # Docker DNS. The upstream below is resolved ONCE at startup (open-source nginx cannot
+  # do otherwise), so the gateway must start already attached to the external network.
+  resolver 127.0.0.11 ipv6=off valid=30s;
+
+  # Pool of persistent upstream connections. Without it every LLM call is a new TLS
+  # handshake: with 6 parallel containers that meant ~2k handshakes from one address in
+  # an hour and a half, Cloudflare started dropping them ('peer closed connection in SSL
+  # handshake', 'upstream prematurely closed connection'), and 29 of 92 cells failed
+  # after exhausting all three attempts on 502.
+  upstream openrouter_up {
+    server openrouter.ai:443;
+    keepalive 32;
+    keepalive_requests 10000;
+    keepalive_timeout 300s;
+  }
+
+  # The agent loop holds long streams; thinking goes through here too.
+  # The request body is NOT limited: the nginx default is 1 MB, and at that limit whole
+  # cells were lost (all three attempts failed with 413) while others paid with a retry.
+  # A prompt with full POSCARs plus the agent's accumulated context legitimately exceeds
+  # a megabyte. A 413 is an ENVIRONMENT failure: it must not decide which cells get
+  # measured.
+  client_max_body_size  0;
+  proxy_connect_timeout 60s;
+  proxy_send_timeout    3600s;
+  proxy_read_timeout    3600s;
+  proxy_buffering       off;
+  # OpenRouter (behind Cloudflare) sends headers larger than the default 4k —
+  # without this nginx returns 502 'upstream sent too big header'.
+  proxy_buffer_size     32k;
+  proxy_buffers         8 32k;
+  proxy_busy_buffers_size 64k;
+
+  server {
+    listen 80;
+    server_name _;
+
+    location /api/v1/ {
+      # proxy_pass to a NAMED upstream without a path part forwards the original URI
+      # as is — no substitution from location is needed. (With a variable instead of a
+      # name, $request_uri would have to be written explicitly: without it every request
+      # went to the upstream root and got the home page HTML with status 200. A named
+      # upstream does not have this trap, and keepalive works only with one.)
+      proxy_pass https://openrouter_up;
+      proxy_ssl_server_name on;
+      proxy_ssl_name openrouter.ai;
+      proxy_set_header Host openrouter.ai;
+      # The gateway sets the key; whatever the agent sent is discarded.
+      proxy_set_header Authorization "Bearer __OPENROUTER_API_KEY__";
+      proxy_set_header Accept-Encoding "";
+      proxy_http_version 1.1;
+      # Required with keepalive: otherwise nginx sends the upstream Connection: close
+      # and the connection pool does not work.
+      proxy_set_header Connection "";
+    }
+
+    location / { return 403 "gateway: only /api/v1/ is allowed\n"; }
+  }
+}
